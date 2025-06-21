@@ -53,7 +53,13 @@ announce_spicy_mode = True
 
 kicked_sessions = set()
 
-BACKUP_PATTERN = 'leaderboard_bckp_*.json'
+BACKUP_DIR = 'backups'
+BACKUP_PATTERN = os.path.join(BACKUP_DIR, 'leaderboard_bckp_*.json')
+
+def log_technical_action(msg):
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with open('server.log', 'a', encoding='utf-8') as f:
+        f.write(f'[TECH] {ts} {msg}\n')
 
 def load_leaderboard():
     """Lädt das Leaderboard aus der JSON-Datei"""
@@ -120,8 +126,20 @@ def update_leaderboard_on_game_end(vote_results):
             if "IMPOSTOR" in word:
                 add_win(player, 'impostor')
                 break
+    # Backup after game end
+    create_leaderboard_backup(reason='game_end')
 
-load_leaderboard()
+def create_leaderboard_backup(reason=None):
+    if not os.path.exists(LEADERBOARD_FILE):
+        return None
+    now = datetime.now()
+    ts = now.strftime('%H-%M-%S')
+    backup_name = f'leaderboard_bckp_{ts}.json'
+    backup_path = os.path.join(BACKUP_DIR, backup_name)
+    shutil.copyfile(LEADERBOARD_FILE, backup_path)
+    if reason:
+        log_technical_action(f'Created leaderboard backup: {backup_name} (reason: {reason})')
+    return backup_name
 
 def get_public_ip():
     """Ermittelt die öffentliche IP-Adresse"""
@@ -837,6 +855,9 @@ def reset_game():
 def control_panel():
     if request.method == "POST":
         password = request.form.get("password")
+        user_ip = request.remote_addr
+        joined_name = session.get('player_name')
+        log_technical_action(f'Control panel login attempt from IP {user_ip}, joined_name={joined_name}, password_used={password}')
         if password == CONTROL_PASSWORD:
             session['control_logged_in'] = True
             return redirect(url_for("control_panel"))
@@ -947,6 +968,7 @@ def api_kick_player():
         return jsonify({'success': False, 'error': 'Not authorized'}), 403
     data = request.get_json(silent=True) or {}
     player_to_kick = data.get('player_name')
+    admin_ip = request.remote_addr
     if not player_to_kick:
         return jsonify({'success': False, 'error': 'No player specified'}), 400
     if player_to_kick in players:
@@ -966,6 +988,7 @@ def api_kick_player():
         del player_sessions[session_to_remove]
         if session_to_remove in session_heartbeats:
             del session_heartbeats[session_to_remove]
+    log_technical_action(f'Player kicked: {player_to_kick} by admin IP {admin_ip}')
     return jsonify({'success': True})
 
 @app.route('/api/reset_leaderboard', methods=['POST'])
@@ -973,16 +996,17 @@ def api_reset_leaderboard():
     if not is_control_user():
         return jsonify({'success': False, 'error': 'Not authorized'}), 403
     data = request.get_json(silent=True) or {}
-    which = data.get('which')
+    which = data.get('which', 'both')
     if which == 'players':
         leaderboard['players'] = {}
+        log_technical_action('Reset player leaderboard')
     elif which == 'impostors':
         leaderboard['impostors'] = {}
-    elif which == 'both':
+        log_technical_action('Reset impostor leaderboard')
+    else:
         leaderboard['players'] = {}
         leaderboard['impostors'] = {}
-    else:
-        return jsonify({'success': False, 'error': 'Invalid option'}), 400
+        log_technical_action('Reset both leaderboards')
     save_leaderboard()
     return jsonify({'success': True})
 
@@ -1025,15 +1049,18 @@ def api_settings():
     if 'heartbeat_timeout' in data:
         try:
             HEARTBEAT_TIMEOUT = int(data['heartbeat_timeout'])
+            log_technical_action(f'Changed heartbeat timeout to {HEARTBEAT_TIMEOUT}')
         except Exception:
             pass
     if 'cleanup_interval' in data:
         try:
             CLEANUP_INTERVAL = int(data['cleanup_interval'])
+            log_technical_action(f'Changed cleanup interval to {CLEANUP_INTERVAL}')
         except Exception:
             pass
     if 'announce_spicy_mode' in data:
         announce_spicy_mode = bool(data['announce_spicy_mode'])
+        log_technical_action(f'Changed announce_spicy_mode to {announce_spicy_mode}')
     return jsonify({'success': True})
 
 @app.route('/api/console_output')
@@ -1042,7 +1069,9 @@ def api_console_output():
     if os.path.exists(log_path):
         with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
             lines = f.readlines()[-40:]
-        return jsonify({'output': ''.join(lines)})
+        # Join lines with <br> for HTML display, one per log entry
+        formatted = '<br>'.join(line.rstrip() for line in lines)
+        return jsonify({'output': formatted})
     else:
         return jsonify({'output': 'No log file found or logging not enabled.'})
 
@@ -1053,9 +1082,11 @@ def api_change_password():
         return jsonify({'success': False, 'error': 'Not authorized'}), 403
     data = request.get_json(silent=True) or {}
     new_password = data.get('new_password', '').strip()
+    admin_ip = request.remote_addr
     if not new_password or len(new_password) < 4:
         return jsonify({'success': False, 'error': 'Passwort zu kurz (min. 4 Zeichen)'}), 400
     CONTROL_PASSWORD = new_password
+    log_technical_action(f'Control password changed by admin IP {admin_ip}')
     return jsonify({'success': True})
 
 @app.route('/api/am_i_kicked')
@@ -1066,24 +1097,23 @@ def api_am_i_kicked():
 
 @app.route('/api/backup_leaderboard')
 def api_backup_leaderboard():
-    if not is_control_user():
-        return jsonify({'success': False, 'error': 'Not authorized'}), 403
-    if os.path.exists(LEADERBOARD_FILE):
-        return send_file(LEADERBOARD_FILE, as_attachment=True, download_name='leaderboard.json')
-    else:
-        return jsonify({'success': False, 'error': 'No leaderboard file found'}), 404
+    files = sorted(glob.glob(BACKUP_PATTERN), reverse=True)
+    if files:
+        backup_file = files[0]
+        return send_file(backup_file, as_attachment=True, download_name=os.path.basename(backup_file))
+    return jsonify({'success': False, 'error': 'No backup file found'}), 404
 
 @app.route('/api/load_leaderboard_backup', methods=['POST'])
 def api_load_leaderboard_backup():
-    if not is_control_user():
-        return jsonify({'success': False, 'error': 'Not authorized'}), 403
-    backup_file = 'leaderboard_bckp'
-    if os.path.exists(backup_file):
-        shutil.copyfile(backup_file, LEADERBOARD_FILE)
-        load_leaderboard()
-        return jsonify({'success': True})
-    else:
+    name = request.args.get('name')
+    if not name:
         return jsonify({'success': False, 'error': 'No backup file found'}), 404
+    backup_path = os.path.join(BACKUP_DIR, name)
+    if os.path.exists(backup_path):
+        shutil.copyfile(backup_path, LEADERBOARD_FILE)
+        log_technical_action(f'Restored leaderboard from backup: {name}')
+        return jsonify({'success': True})
+    return jsonify({'success': False, 'error': 'No backup file found'}), 404
 
 @app.route('/api/upload_leaderboard', methods=['POST'])
 def api_upload_leaderboard():
@@ -1092,6 +1122,7 @@ def api_upload_leaderboard():
     if 'file' not in request.files:
         return jsonify({'success': False, 'error': 'No file uploaded'}), 400
     file = request.files['file']
+    admin_ip = request.remote_addr
     try:
         data = file.read()
         json_data = json.loads(data)
@@ -1103,69 +1134,36 @@ def api_upload_leaderboard():
         with open(LEADERBOARD_FILE, 'wb') as f:
             f.write(data)
         load_leaderboard()
+        log_technical_action(f'Uploaded new leaderboard file by admin IP {admin_ip}')
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': f'Invalid file: {e}'}), 400
 
-@app.route('/api/download_leaderboard_backup')
-def api_download_leaderboard_backup():
-    if not is_control_user():
-        return jsonify({'success': False, 'error': 'Not authorized'}), 403
-    backup_file = 'leaderboard_bckp'
-    if os.path.exists(backup_file):
-        return send_file(backup_file, as_attachment=True, download_name='leaderboard_bckp.json')
-    else:
-        return jsonify({'success': False, 'error': 'No backup file found'}), 404
-
-@app.route('/api/upload_leaderboard_file', methods=['POST'])
-def api_upload_leaderboard_file():
-    if not is_control_user():
-        return jsonify({'success': False, 'error': 'Not authorized'}), 403
-    if 'file' not in request.files:
-        return jsonify({'success': False, 'error': 'No file uploaded'}), 400
-    file = request.files['file']
-    try:
-        data = file.read()
-        json_data = json.loads(data)
-        # Validate leaderboard format
-        if (not isinstance(json_data, dict) or
-            'players' not in json_data or 'impostors' not in json_data or
-            not isinstance(json_data['players'], dict) or not isinstance(json_data['impostors'], dict)):
-            return jsonify({'success': False, 'error': 'Invalid leaderboard format'}), 400
-        with open(LEADERBOARD_FILE, 'wb') as f:
-            f.write(data)
-        load_leaderboard()
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'success': False, 'error': f'Invalid file: {e}'}), 400
+@app.route('/api/download_leaderboard_backup_file')
+def api_download_leaderboard_backup_file():
+    name = request.args.get('name')
+    if not name:
+        return jsonify({'success': False, 'error': 'Invalid backup file'}), 400
+    backup_path = os.path.join(BACKUP_DIR, name)
+    if not os.path.exists(backup_path) or not name.startswith('leaderboard_bckp_') or not name.endswith('.json'):
+        return jsonify({'success': False, 'error': 'Invalid backup file'}), 400
+    log_technical_action(f'Downloaded leaderboard backup: {name}')
+    return send_file(backup_path, as_attachment=True, download_name=name)
 
 @app.route('/api/create_leaderboard_backup', methods=['POST'])
 def api_create_leaderboard_backup():
     if not is_control_user():
         return jsonify({'success': False, 'error': 'Not authorized'}), 403
-    if not os.path.exists(LEADERBOARD_FILE):
+    backup_name = create_leaderboard_backup(reason='manual')
+    if backup_name:
+        return jsonify({'success': True, 'backup': backup_name})
+    else:
         return jsonify({'success': False, 'error': 'No leaderboard file found'}), 404
-    now = datetime.now()
-    ts = now.strftime('%d-%H-%M')
-    backup_name = f'leaderboard_bckp_{ts}.json'
-    shutil.copyfile(LEADERBOARD_FILE, backup_name)
-    return jsonify({'success': True, 'backup': backup_name})
 
 @app.route('/api/list_leaderboard_backups')
 def api_list_leaderboard_backups():
-    if not is_control_user():
-        return jsonify({'success': False, 'error': 'Not authorized'}), 403
-    files = sorted(glob.glob(BACKUP_PATTERN), reverse=True)
+    files = sorted([os.path.basename(f) for f in glob.glob(BACKUP_PATTERN)], reverse=True)
     return jsonify({'success': True, 'backups': files})
-
-@app.route('/api/download_leaderboard_backup_file')
-def api_download_leaderboard_backup_file():
-    if not is_control_user():
-        return jsonify({'success': False, 'error': 'Not authorized'}), 403
-    name = request.args.get('name')
-    if not name or not os.path.exists(name) or not name.startswith('leaderboard_bckp_') or not name.endswith('.json'):
-        return jsonify({'success': False, 'error': 'Invalid backup file'}), 400
-    return send_from_directory('.', name, as_attachment=True)
 
 def add_game_event(event_type, message, emoji="🎮"):
     """Adds a game event message with special styling"""
@@ -1226,6 +1224,26 @@ def start_server():
         print("🖥️ Kein Display erkannt - Server läuft im Headless-Modus")
         print(f"📱 Öffne http://{local_ip}:5000 in deinem Browser (lokales Netzwerk)")
         print(f"🌍 Öffne http://{public_ip}:5000 in deinem Browser (Internet)")
+
+# --- Periodic backup thread ---
+def start_periodic_backup_thread():
+    def backup_loop():
+        while True:
+            time.sleep(12 * 60 * 60)  # 12 hours
+            create_leaderboard_backup(reason='periodic')
+    t = threading.Thread(target=backup_loop, daemon=True)
+    t.start()
+
+# --- Start periodic backup thread at startup ---
+start_periodic_backup_thread()
+
+# Ensure backup directory exists at startup
+if not os.path.exists(BACKUP_DIR):
+    os.makedirs(BACKUP_DIR)
+
+# --- Clear log file at startup ---
+with open('server.log', 'w', encoding='utf-8') as f:
+    f.write('')
 
 if __name__ == '__main__':
     is_railway = os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('PORT')
