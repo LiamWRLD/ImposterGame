@@ -204,7 +204,7 @@ def update_heartbeat(session_id):
 
 def cleanup_inactive_sessions():
     """Entfernt inaktive Sessions und Spieler"""
-    global players, game_players, player_sessions, session_heartbeats
+    global players, game_players, player_sessions, session_heartbeats, start_votes
     current_time = datetime.now()
     inactive_sessions = []
     for session_id, last_heartbeat in session_heartbeats.items():
@@ -217,6 +217,10 @@ def cleanup_inactive_sessions():
                 continue
             if not game_started and player_name in players:
                 players.remove(player_name)
+                # Clear ALL start votes when any player leaves
+                if start_votes:  # Only clear if there were votes
+                    start_votes.clear()
+                    add_player_message('SYSTEM', f"{player_name} hat die Lobby verlassen und das Voting wurde gestoppt.")
                 # Add game event for player timeout
                 add_game_event('player_timeout', f"⏰ {player_name} wurde wegen Inaktivität entfernt!", "⏰")
                 
@@ -550,16 +554,22 @@ def rejoin_game():
 @app.route("/leave_lobby")
 def leave_lobby():
     """Verlasse die Lobby"""
-    global players
+    global players, start_votes
     player_name = session.get('player_name')
     session_id = session.get('session_id')
     was_control = session.get('control_logged_in', False)
     if player_name and session_id:
         if not game_started and player_name in players and not was_control:
             players.remove(player_name)
-            # Add game event for player leave
-            add_game_event('player_leave', f"👋 {player_name} hat die Lobby verlassen!", "👋")
             
+            # If start voting was active, reset it and notify players.
+            if start_votes:
+                start_votes.clear()
+                add_player_message('SYSTEM', f"{player_name} hat die Lobby verlassen und das Voting wurde gestoppt.")
+            else:
+                # Otherwise, use the original "player left" message.
+                add_game_event('player_leave', f"👋 {player_name} hat die Lobby verlassen!", "👋")
+
             # Check if not enough players to start the game
             if len(players) < 3:
                 add_game_event('lobby_not_ready', f"⏳ Nicht genug Spieler zum Starten ({len(players)}/3)", "⏳")
@@ -685,14 +695,24 @@ def guess_word():
 
 @app.route("/kick_player", methods=["POST"])
 def kick_player():
-    global players, game_players, player_sessions, session_heartbeats, kicked_sessions
+    global players, game_players, player_sessions, session_heartbeats, kicked_sessions, start_votes
     player_to_kick = request.form.get('player_name')
     if not player_to_kick:
         return jsonify({'error': 'Kein Spieler angegeben'})
+
+    # Determine if player is in lobby or game and handle messaging
     if player_to_kick in players:
         players.remove(player_to_kick)
-    if player_to_kick in game_players:
+        if start_votes:
+            start_votes.clear()
+            add_player_message('SYSTEM', f"{player_to_kick} wurde entfernt und das Voting wurde gestoppt.")
+        else:
+            add_game_event('player_kick', f"🚪 {player_to_kick} wurde aus dem Spiel entfernt!", "🚪")
+    elif player_to_kick in game_players:
         del game_players[player_to_kick]
+        add_game_event('player_kick', f"🚪 {player_to_kick} wurde aus dem Spiel entfernt!", "🚪")
+
+    # Common cleanup for the kicked player
     if player_to_kick in assigned_words:
         del assigned_words[player_to_kick]
     if player_to_kick in votes:
@@ -708,10 +728,48 @@ def kick_player():
         if session_to_remove in session_heartbeats:
             del session_heartbeats[session_to_remove]
     
-    # Add game event for player kick
-    add_game_event('player_kick', f"🚪 {player_to_kick} wurde aus dem Spiel entfernt!", "🚪")
-    
     return jsonify({'success': True, 'message': f'{player_to_kick} wurde gekickt'})
+
+@app.route('/api/kick_player', methods=['POST'])
+def api_kick_player():
+    global players, game_players, player_sessions, session_heartbeats, kicked_sessions, start_votes
+    if not is_control_user():
+        return jsonify({'success': False, 'error': 'Not authorized'}), 403
+    data = request.get_json(silent=True) or {}
+    player_to_kick = data.get('player_name')
+    admin_ip = request.remote_addr
+    if not player_to_kick:
+        return jsonify({'success': False, 'error': 'No player specified'}), 400
+
+    # Determine if player is in lobby or game and handle messaging
+    if player_to_kick in players:
+        players.remove(player_to_kick)
+        if start_votes:
+            start_votes.clear()
+            add_player_message('SYSTEM', f"{player_to_kick} wurde entfernt und das Voting wurde gestoppt.")
+        else:
+            add_game_event('player_kick', f"🚪 {player_to_kick} wurde aus dem Spiel entfernt!", "🚪")
+    elif player_to_kick in game_players:
+        del game_players[player_to_kick]
+        add_game_event('player_kick', f"🚪 {player_to_kick} wurde aus dem Spiel entfernt!", "🚪")
+
+    # Common cleanup for the kicked player
+    if player_to_kick in assigned_words:
+        del assigned_words[player_to_kick]
+    if player_to_kick in votes:
+        del votes[player_to_kick]
+    session_to_remove = None
+    for sid, name in player_sessions.items():
+        if name == player_to_kick:
+            session_to_remove = sid
+            break
+    if session_to_remove:
+        kicked_sessions.add(session_to_remove)
+        del player_sessions[session_to_remove]
+        if session_to_remove in session_heartbeats:
+            del session_heartbeats[session_to_remove]
+    log_technical_action(f'Player kicked: {player_to_kick} by admin IP {admin_ip}')
+    return jsonify({'success': True})
 
 @app.route("/vote", methods=["POST"])
 def vote():
@@ -757,8 +815,15 @@ def end_voting():
 @app.route("/return_to_lobby")
 def return_to_lobby():
     """Zurück zur Lobby - Reset für neues Spiel"""
-    global game_started, assigned_words, revealed, game_messages, current_starter, votes, voting_active, vote_results, game_ended, winning_word, impostor_guess_used, game_players
+    global game_started, assigned_words, revealed, game_messages, current_starter, votes, voting_active, vote_results, game_ended, winning_word, impostor_guess_used, game_players, players, player_sessions, session_heartbeats, start_votes
     
+    current_player = session.get('player_name')
+    session_id = session.get('session_id')
+    
+    # Reset game state for ALL players, not just the current one
+    # This prevents ghost players and ensures consistency
+    
+    # Clear all game state
     game_started = False
     assigned_words = {}
     revealed = False
@@ -771,8 +836,23 @@ def return_to_lobby():
     winning_word = ""
     impostor_guess_used = False
     game_players = {}
+    start_votes.clear()
     
-    session.pop('player_name', None)
+    # Reset players list to only include active sessions
+    # This ensures only players with valid sessions remain
+    active_players = []
+    for sid, name in player_sessions.items():
+        if sid in session_heartbeats:
+            active_players.append(name)
+    players = active_players
+    
+    # Keep the current player in the lobby (don't remove them)
+    # They should be able to participate in the next game
+    if current_player and current_player not in players and session_id in player_sessions:
+        players.append(current_player)
+    
+    # Don't clear the session - keep the player logged in
+    # session.pop('player_name', None)  # Removed this line
     
     # Add game event for return to lobby
     add_game_event('lobby_return', "🏠 Zurück in der Lobby - Neues Spiel kann beginnen!", "🏠")
@@ -962,35 +1042,6 @@ def api_control_stats():
     }
     return jsonify(stats)
 
-@app.route('/api/kick_player', methods=['POST'])
-def api_kick_player():
-    if not is_control_user():
-        return jsonify({'success': False, 'error': 'Not authorized'}), 403
-    data = request.get_json(silent=True) or {}
-    player_to_kick = data.get('player_name')
-    admin_ip = request.remote_addr
-    if not player_to_kick:
-        return jsonify({'success': False, 'error': 'No player specified'}), 400
-    if player_to_kick in players:
-        players.remove(player_to_kick)
-    if player_to_kick in game_players:
-        del game_players[player_to_kick]
-    if player_to_kick in assigned_words:
-        del assigned_words[player_to_kick]
-    if player_to_kick in votes:
-        del votes[player_to_kick]
-    session_to_remove = None
-    for sid, name in player_sessions.items():
-        if name == player_to_kick:
-            session_to_remove = sid
-            break
-    if session_to_remove:
-        del player_sessions[session_to_remove]
-        if session_to_remove in session_heartbeats:
-            del session_heartbeats[session_to_remove]
-    log_technical_action(f'Player kicked: {player_to_kick} by admin IP {admin_ip}')
-    return jsonify({'success': True})
-
 @app.route('/api/reset_leaderboard', methods=['POST'])
 def api_reset_leaderboard():
     if not is_control_user():
@@ -1069,7 +1120,6 @@ def api_console_output():
     if os.path.exists(log_path):
         with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
             lines = f.readlines()[-40:]
-        # Join lines with <br> for HTML display, one per log entry
         formatted = '<br>'.join(line.rstrip() for line in lines)
         return jsonify({'output': formatted})
     else:
@@ -1311,11 +1361,11 @@ if __name__ == '__main__':
             except ImportError:
                 print("⚠️ Tkinter nicht verfügbar - starte im Headless-Modus")
                 start_server()
-                app.run(host='0.0.0.0', port=5000, debug=True)
+                app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
         else:
             print("🖥️ Headless-Modus erkannt - starte Server ohne GUI")
             start_server()
-            app.run(host='0.0.0.0', port=5000, debug=True)
+            app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
 
 else:
     start_cleanup_thread()
