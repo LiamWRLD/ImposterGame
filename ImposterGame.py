@@ -14,6 +14,9 @@ import re
 import shutil
 import glob
 
+# Initialize random seed for true randomness
+random.seed()
+
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
 
@@ -45,6 +48,7 @@ game_ended = False
 winning_word = ""
 impostor_guess_used = False
 start_votes = set()
+shuffled_player_order = []  # Store randomized player order for display
 
 HEARTBEAT_TIMEOUT = 6
 CLEANUP_INTERVAL = 6
@@ -292,8 +296,8 @@ def get_word_list():
         return normal_words
 
 def select_starter(players_list, impostor):
-    """Wählt einen Starter aus - Impostor hat 20% Chance, normale Spieler 80%"""
-    if random.random() < 0.2:
+    """Wählt einen Starter aus - Impostor hat 10% Chance, normale Spieler 90%"""
+    if random.random() < 0.1:
         return impostor
     else:
         normal_players = [p for p in players_list if p != impostor]
@@ -305,7 +309,7 @@ def is_control_user():
 
 def check_all_voted():
     """Prüft ob alle aktiven Spieler gevoted haben"""
-    active_game_players = list(game_players.keys()) if game_started else players
+    active_game_players = shuffled_player_order if game_started else players
     return len(votes) >= len(active_game_players)
 
 def auto_end_voting():
@@ -400,7 +404,7 @@ def api_status():
     if revealed and player_name and player_name in assigned_words:
         player_word = assigned_words[player_name]
     
-    active_players = list(game_players.keys()) if game_started else players
+    active_players = shuffled_player_order if game_started else players
     
     return jsonify({
         'players': active_players,
@@ -437,7 +441,7 @@ def index():
         session.clear()
         kicked_message = "Du wurdest aus dem Spiel entfernt. Du kannst erneut beitreten."
         return render_template("index.html",
-                             players=list(game_players.keys()) if game_started else players,
+                             players=shuffled_player_order if game_started else players,
                              game_started=game_started,
                              spicy_mode=spicy_mode,
                              force_spicy=force_spicy,
@@ -512,7 +516,7 @@ def index():
     can_rejoin = (game_started and player_name in assigned_words and 
                   player_name not in game_players)
     return render_template("index.html", 
-                         players=list(game_players.keys()) if game_started else players,
+                         players=shuffled_player_order if game_started else players,
                          game_started=game_started,
                          spicy_mode=spicy_mode,
                          force_spicy=force_spicy,
@@ -861,17 +865,21 @@ def return_to_lobby():
 
 @app.route("/start")
 def start_game():
-    global assigned_words, game_started, current_starter, game_ended, winning_word, impostor_guess_used, game_players, start_votes
+    global assigned_words, game_started, current_starter, game_ended, winning_word, impostor_guess_used, game_players, start_votes, shuffled_player_order
     start_votes.clear()
     
     if not players or len(players) < 3:
         return "Mindestens 3 Spieler benötigt."
     
+    # Randomize the order of players for display
+    shuffled_player_order = players.copy()
+    random.shuffle(shuffled_player_order)
+    
     word_list = get_word_list()
     word = random.choice(word_list)
     impostor = random.choice(players)
     
-    current_starter = select_starter(players, impostor)
+    current_starter = select_starter(shuffled_player_order, impostor)
     winning_word = word
     
     for player in players:
@@ -907,7 +915,7 @@ def reveal_words():
 
 @app.route("/reset")
 def reset_game():
-    global players, game_started, assigned_words, revealed, game_messages, current_starter, votes, voting_active, vote_results, game_ended, winning_word, impostor_guess_used, game_players, player_sessions, session_heartbeats, start_votes
+    global players, game_started, assigned_words, revealed, game_messages, current_starter, votes, voting_active, vote_results, game_ended, winning_word, impostor_guess_used, game_players, player_sessions, session_heartbeats, start_votes, shuffled_player_order
     start_votes.clear()
     
     # Add game event for game reset
@@ -928,6 +936,7 @@ def reset_game():
     game_players = {}
     player_sessions = {}
     session_heartbeats = {}
+    shuffled_player_order = []
     
     return redirect(url_for("index"))
 
@@ -990,7 +999,7 @@ def api_start_votes():
     return jsonify({
         'votes': list(start_votes),
         'total': len(players),
-        'players': players,
+        'players': shuffled_player_order if game_started else players,
         'game_started': game_started
     })
 
@@ -1024,7 +1033,7 @@ def api_control_stats():
     stats = {
         'game_state': 'lobby' if not game_started else ('ended' if game_ended else ('voting' if voting_active else 'running')),
         'player_count': len(players) if not game_started else len(game_players),
-        'players': list(players) if not game_started else list(game_players.keys()),
+        'players': shuffled_player_order if game_started else list(players),
         'impostor': next((p for p, w in assigned_words.items() if 'IMPOSTOR' in w), None) if game_started else None,
         'spicy_mode': 'forced' if force_spicy else ('possible' if spicy_mode else 'disabled'),
         'round': 1 if game_started else 0,

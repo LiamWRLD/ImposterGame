@@ -1,7 +1,14 @@
 {
     "players": {
-        "test1": 1,
-        "test3": 1
+        "fabian": 28,
+        "liam": 22,
+        "helene": 20,
+        "ben": 17
     },
-    "impostors": {}
+    "impostors": {
+        "helene": 1,
+        "liam": 1,
+        "fabian": 1,
+        "ben": 1
+    }
 }
