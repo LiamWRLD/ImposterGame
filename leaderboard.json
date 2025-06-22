@@ -1,13 +1,13 @@
 {
     "players": {
         "fabian": 28,
-        "liam": 22,
+        "liam": 999999999,
         "helene": 20,
         "ben": 17
     },
     "impostors": {
         "helene": 1,
-        "liam": 1,
+        "liam": 999999999,
         "fabian": 1,
         "ben": 1
     }
